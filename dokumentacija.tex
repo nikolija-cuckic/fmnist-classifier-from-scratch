@@ -1,0 +1,198 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[serbian]{babel}
+\usepackage{lmodern}
+\usepackage{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\geometry{margin=2.5cm}
+
+\title{Dokumentacija: CNN klasifikator odeće (Fashion-MNIST)\vspace{4pt}\\\large Teorija i veza sa implementacijom}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\tableofcontents
+
+\section{Uvod}
+Ovaj dokument objašnjava teorijsku pozadinu metoda korišćenih u projektu za klasifikaciju slika odeće iz skupa Fashion-MNIST, i precizno povezuje matematiku sa implementacijom u kodu. Glavne komponente su: konvolucioni slojevi, nelinearnosti (ReLU), normalizacije (BatchNorm, LayerNorm), pooling (max/avg, global avg), potpuno povezani slojevi (Dense), softmax unakrsna entropija (loss), povratno širenje greške (backpropagation) i optimizatori (SGD, Momentum, NAG, RMSProp, Adam). Trening petlja i evaluacija takođe su opisani.
+
+Implementacija je podeljena u module:
+\begin{itemize}
+  \item Slojevi: \texttt{src/ccc/models/layers/*.py} (npr. \texttt{conv2d.py}, \texttt{relu.py}, \texttt{maxpool2d.py}, \texttt{avg\_pool2d.py}, \texttt{global\_avg\_pool2d.py}, \texttt{batch\_norm.py}, \texttt{layer\_norm.py}, \texttt{dense.py}, \texttt{loss.py}, \texttt{utils.py}).
+  \item Modeli: \texttt{src/ccc/models/cnn\_small.py}, \texttt{cnn\_medium.py}, \texttt{cnn\_high.py}, \texttt{cnn.py}.
+  \item Optimizatori: \texttt{src/ccc/optim/*.py}.
+  \item Trening i metrike: \texttt{src/ccc/engine/trainer.py}, \texttt{src/ccc/engine/metrics.py}.
+  \item Podaci: \texttt{src/ccc/data/fmnist.py}.
+\end{itemize}
+
+\section{Podaci i predobrada}
+Koristi se Fashion-MNIST (28\,$\times$\,28, kanal $C{=}1$). U \texttt{src/ccc/data/fmnist.py}: pikseli se normiraju deljenjem sa 255 (u $[0,1]$), formira se one-hot vektor ciljeva za 10 klasa, i pravi se trening/validaciona podela slučajnim permutovanjem. Formalno, ulaz za model je tenzor $\mathbf{X} \in \mathbb{R}^{N\times 1\times 28\times 28}$.
+
+\section{Konvolucioni sloj (Conv2D)}
+\subsection{Diskretna 2D konvolucija/korilacija}
+U dubokom učenju često se koristi \emph{diskretna unakrsna korelacija} (bez obrtanja kernela). Za ulaz $x \in \mathbb{R}^{C\times H\times W}$ i filtere $W \in \mathbb{R}^{O\times C\times k\times k}$ sa bias-om $b\in\mathbb{R}^{O}$, izlazni tenzor $y \in \mathbb{R}^{O\times H'\times W'}$ je:
+\begin{equation}
+ y[o,i,j] \;=\; \sum_{c=1}^{C} \sum_{u=0}^{k-1} \sum_{v=0}^{k-1} W[o,c,u,v]\; x\bigl[c,\, i\cdot s + u - p,\, j\cdot s + v - p\bigr] \; + \; b[o],
+\end{equation}
+gde su $s$ korak (stride), $p$ popunjavanje (padding), a dimenzije izlaza
+\begin{equation}
+ H' = \left\lfloor\frac{H + 2p - k}{s}\right\rfloor + 1, \qquad W' = \left\lfloor\frac{W + 2p - k}{s}\right\rfloor + 1.
+\end{equation}
+Ova formula je u kodu enkapsulirana preko \texttt{im2col} tehnike.
+
+\subsection{im2col matrikska formulacija i implementacija}
+U \texttt{src/ccc/models/layers/utils.py} funkcija \texttt{im2col\_indices} rearanžira sve lokalne \emph{receptivne oblasti} veličine $C\cdot k\cdot k$ u kolone matrice $X_{\text{col}} \in \mathbb{R}^{(Ck^2)\times (N H' W')}$, dok se težine reshapuju u $W_{\text{col}} \in \mathbb{R}^{O\times (Ck^2)}$. Tada je napredni prolaz:
+\begin{equation}
+ Y_{\text{col}} = W_{\text{col}}\, X_{\text{col}} + b\,\mathbf{1}^\top, \qquad Y = \text{reshape/transpozicija}(Y_{\text{col}}) \in \mathbb{R}^{N\times O\times H'\times W'}.
+\end{equation}
+Ovo je tačno ono što radi \texttt{Conv2D.forward} u \texttt{src/ccc/models/layers/conv2d.py}.
+
+\subsection{Gradijenti (backprop) kroz Conv2D}
+Neka je $G = \frac{\partial \mathcal{L}}{\partial Y} \in \mathbb{R}^{O\times (N H' W')}$ matrica gradijenata po izlazu (u kodu: \texttt{grad\_out\_reshaped}). Tada iz linearne algebre sledi:
+\begin{align}
+ \frac{\partial \mathcal{L}}{\partial W_{\text{col}}} &= G\, X_{\text{col}}^\top, \\
+ \frac{\partial \mathcal{L}}{\partial b} &= G\, \mathbf{1}, \\
+ \frac{\partial \mathcal{L}}{\partial X_{\text{col}}} &= W_{\text{col}}^\top \! G.
+\end{align}
+Zatim se \texttt{col2im\_indices} koristi da se $\partial \mathcal{L}/\partial X_{\text{col}}$ vrati u tenzorski oblik $\partial \mathcal{L}/\partial X$ dimenzije $N\times C\times H\times W$. Ovo je upravo implementirano u \texttt{Conv2D.backward}: računa se \texttt{dW = (G @ cols.T).reshape(W.shape)}, \texttt{db = G.sum(axis=1)}, a grad po ulazu vraća \texttt{col2im}.
+
+\subsection{Inicijalizacija}
+Težine se inicijalizuju He inicijalizacijom $\mathcal{N}(0,\, 2/\text{fan\_in})$ (vidi \texttt{Conv2D.__init__} i \texttt{Dense.__init__}), što je pogodno za ReLU aktivacije.
+
+\section{Nelinearnosti i proste operacije}
+\subsection{ReLU}
+ReLU je $f(x)=\max(0,x)$. Gradijent je $f'(x)=\mathbf{1}_{x>0}$. Implementacija čuva masku \texttt{(x>0)} i primenjuje je i napred i unazad (\texttt{src/ccc/models/layers/relu.py}).
+
+\subsection{Flatten}
+\texttt{Flatten} reshapu je $\mathbb{R}^{N\times C\times H\times W} \to \mathbb{R}^{N\times (CHW)}$, a backward vraća originalni oblik.
+
+\section{Pooling slojevi}
+\subsection{Maks pooling}
+Za kernel $k$ i korak $s$, \emph{max-pool} uzima maksimum u svakoj lokalnoj oblasti. U naprednom prolazu koristi se \texttt{im2col} (vidi \texttt{src/ccc/models/layers/maxpool2d.py}), a unazad grad ide samo kroz poziciju koja je bila argmax:
+\begin{equation}
+ \frac{\partial \mathcal{L}}{\partial x} = \text{unpool}\bigl(\text{argmax maska},\; \frac{\partial \mathcal{L}}{\partial y}\bigr).
+\end{equation}
+
+\subsection{Prosečni pooling}
+\emph{Avg-pool} računa srednju vrednost u kernelu, pa se gradijent ravnomerno deli:
+\begin{equation}
+ y = \frac{1}{k^2} \sum_{u,v} x_{u,v} \;\Rightarrow\; \frac{\partial \mathcal{L}}{\partial x_{u,v}} = \frac{1}{k^2}\, \frac{\partial \mathcal{L}}{\partial y}.
+\end{equation}
+Implementacija koristi \texttt{im2col} i sredinu po kolonama (\texttt{src/ccc/models/layers/avgpool2d.py}). Globalni prosek je specijalan slučaj sa kernelom $H\times W$ (vidi takođe \texttt{global\_avg\_pool2d.py}).
+
+\section{Batch normalizacija i Layer normalizacija}
+\subsection{BatchNorm (2D)}
+Za kanale $c=1,\dots,C$, normalizuje se preko svih primera i prostornih pozicija ($N\cdot H\cdot W$ vrednosti po kanalu):
+\begin{align}
+ \mu_c &= \frac{1}{m} \sum_{n,h,w} x_{n,c,h,w}, \qquad \sigma_c^2 = \frac{1}{m} \sum_{n,h,w} (x_{n,c,h,w}-\mu_c)^2, \\
+ \hat{x}_{n,c,h,w} &= \frac{x_{n,c,h,w}-\mu_c}{\sqrt{\sigma_c^2+\varepsilon}}, \qquad y_{n,c,h,w} = \gamma_c \hat{x}_{n,c,h,w} + \beta_c.
+\end{align}
+Gradijenti su standardni: $\partial \mathcal{L}/\partial \beta_c = \sum \partial \mathcal{L}/\partial y$, $\partial \mathcal{L}/\partial \gamma_c = \sum (\partial \mathcal{L}/\partial y)\hat{x}$, a $\partial \mathcal{L}/\partial x$ kroz derivacije \emph{var} i \emph{mean}. Implementacija je u \texttt{src/ccc/models/layers/batch\_norm.py} i odgovara formuli sa $m=N H W$.
+
+\subsection{LayerNorm (1D)}
+LayerNorm normalizuje po \,\emph{feature}-ima u okviru jedne instance: za $x\in\mathbb{R}^{N\times D}$, po formuli kao iznad ali sa srednjom vrednošću i varijansom po dimenziji $D$ za svaki primer. Implementacija je u \texttt{src/ccc/models/layers/layer\_norm.py}.
+
+\section{Potpuno povezani sloj (Dense)}
+Za $x\in\mathbb{R}^{N\times d_{in}}$, $W\in\mathbb{R}^{d_{out}\times d_{in}}$, $b\in\mathbb{R}^{d_{out}}$:
+\begin{align}
+ y &= x W^\top + b, \\
+ \frac{\partial \mathcal{L}}{\partial W} &= \left(\frac{\partial \mathcal{L}}{\partial y}\right)^\top x, \quad
+ \frac{\partial \mathcal{L}}{\partial b} = \sum_{n} \frac{\partial \mathcal{L}}{\partial y_{n,:}}, \quad
+ \frac{\partial \mathcal{L}}{\partial x} = \frac{\partial \mathcal{L}}{\partial y} W.
+\end{align}
+Ovo je implementirano u \texttt{src/ccc/models/layers/dense.py}.
+
+\section{Funkcija greške: Softmax + unakrsna entropija}
+Za logite $z\in\mathbb{R}^{N\times K}$ i one-hot mete $Y\in\{0,1\}^{N\times K}$, softmax verovatnoće su
+\begin{equation}
+ p_{n,k} = \frac{e^{z_{n,k}-\max_j z_{n,j}}}{\sum_j e^{z_{n,j}-\max_j z_{n,j}}},
+\end{equation}
+gde je oduzimanje maksimuma numerička stabilizacija. Unakrsna entropija je
+\begin{equation}
+ \mathcal{L} = -\frac{1}{N} \sum_{n=1}^N \sum_{k=1}^K Y_{n,k} \log(p_{n,k}+\varepsilon).
+\end{equation}
+Standardni rezultat diferenciranja daje
+\begin{equation}
+ \frac{\partial \mathcal{L}}{\partial z} = \frac{1}{N}(p - Y),
+\end{equation}
+što je direktno korišćeno u \texttt{src/ccc/models/layers/loss.py}.
+
+\section{Backpropagation kroz celu mrežu}
+Kompozicija slojeva je sekvenca funkcija. Ako je $z^{(L)}$ izlaz poslednjeg sloja, a $\delta^{(L)}=\partial \mathcal{L}/\partial z^{(L)}$, tada se za svaki sloj $\ell$ unazad računa $\delta^{(\ell-1)} = \delta^{(\ell)}\,\frac{\partial z^{(\ell)}}{\partial z^{(\ell-1)}}$, uz odgovarajuće gradijente po parametrima. U kodu svaki sloj ima \texttt{forward} i \texttt{backward}, a modeli kompoziciono pozivaju \texttt{backward} obrnutim redosledom (npr. \texttt{src/ccc/models/cnn\_high.py}).
+
+\paragraph{Posebno: Conv2D.} Zbog \texttt{im2col} formulacije, backprop je efikasno matriksko računanje (vidi odeljak o gradijentima Conv2D). Ovo precizno odgovara teorijskim jednačinama i olakšava implementaciju.
+
+\section{Optimizacija}
+Neka su $\theta$ svi parametri modela i $g=\nabla_{\theta}\mathcal{L}$. Implementirani su sledeći koraci ažuriranja:
+\subsection{SGD}\vspace{-6pt}
+\begin{equation}
+ \theta \leftarrow \theta - \eta\, g.
+\end{equation}
+Implementacija: \texttt{src/ccc/optim/sgd.py}.
+
+\subsection{Momentum}\vspace{-6pt}
+\begin{align}
+ v &\leftarrow \mu v - \eta g, & \theta &\leftarrow \theta + v.
+\end{align}
+Implementacija: \texttt{src/ccc/optim/momentum.py}.
+
+\subsection{Nesterov (NAG)}\vspace{-6pt}
+Skicirano kao ažuriranje sa ``pogledom unapred'':
+\begin{align}
+ v_{t} &\leftarrow \mu v_{t-1} - \eta g, & \theta &\leftarrow \theta - \mu v_{t-1} + (1+\mu) v_t.
+\end{align}
+Implementacija: \texttt{src/ccc/optim/nag.py}.
+
+\subsection{RMSProp}\vspace{-6pt}
+\begin{align}
+ s &\leftarrow \rho s + (1-\rho) g\odot g, & \theta &\leftarrow \theta - \eta\, g / (\sqrt{s}+\varepsilon).
+\end{align}
+Implementacija: \texttt{src/ccc/optim/rmsprop.py}.
+
+\subsection{Adam}\vspace{-6pt}
+\begin{align}
+ m &\leftarrow \beta_1 m + (1-\beta_1) g, & v &\leftarrow \beta_2 v + (1-\beta_2) g\odot g,\\
+ \hat m &= m/(1-\beta_1^t), & \hat v &= v/(1-\beta_2^t), & \theta &\leftarrow \theta - \eta\, \hat m / (\sqrt{\hat v}+\varepsilon).
+\end{align}
+Implementacija: \texttt{src/ccc/optim/adam.py}.
+
+\section{Arhitekture modela i tok dimenzija}
+\subsection{Primer: CNNHigh}
+U \texttt{src/ccc/models/cnn\_high.py}: četiri \texttt{Conv2D}+\texttt{BatchNorm}+\texttt{ReLU} bloka, dva max-poola (28$\to$14, 14$\to$7), globalni avg-pool i \texttt{Dense} u klase. Tok dimenzija za ulaz $(N,1,28,28)$:
+\begin{align*}
+ (N,1,28,28) &\xrightarrow{\,3\times3,\;p{=}1\,} (N,32,28,28) \xrightarrow{\text{BN+ReLU}} (N,32,28,28)\\
+ &\xrightarrow{\,3\times3,\;p{=}1\,} (N,64,28,28) \xrightarrow{\text{BN+ReLU}} (N,64,28,28) \xrightarrow{\text{MaxPool }2,2} (N,64,14,14)\\
+ &\xrightarrow{\,3\times3,\;p{=}1\,} (N,64,14,14) \xrightarrow{\text{BN+ReLU}} (N,64,14,14) \xrightarrow{\text{MaxPool }2,2} (N,64,7,7)\\
+ &\xrightarrow{\,3\times3,\;p{=}1\,} (N,64,7,7) \xrightarrow{\text{BN+ReLU}} (N,64,7,7) \xrightarrow{\text{GlobalAvg}} (N,64) \xrightarrow{\text{Dense}} (N,10).
+\end{align*}
+Dimenzije su konzistentne sa formulom za $H',W'$ i kodom u \texttt{utils.get\_output\_size}.
+
+\subsection{Ostali modeli}
+\texttt{CNNSmall} i \texttt{CNNMedium} (\texttt{src/ccc/models/cnn\_small.py}, \texttt{cnn\_medium.py}) koriste kombinacije \texttt{Conv2D}+\texttt{BatchNorm}+\texttt{ReLU}+\texttt{MaxPool2D} blokova sa završnim \texttt{Dense} slojevima, uz \texttt{LayerNorm1D} u potpuno povezanoj fazi. Model \texttt{CNN} u \texttt{src/ccc/models/cnn.py} koristi i \texttt{AvgPool2D} i više \texttt{Dense} slojeva.
+
+\section{Trening, evaluacija i rani prekid}
+Trening petlja u \texttt{src/ccc/engine/trainer.py} radi mini-batch stohastičku optimizaciju: za svaki batch računa se \texttt{forward}, gubitak i gradijent preko \texttt{loss\_and\_grad}, zatim \texttt{backward} kroz model i jedan od optimizacionih koraka. Vodi se istorija trening/validacionog gubitka i validacione tačnosti; čuva se najbolji model po najnižem validacionom gubitku. Rani prekid (early stopping) se aktivira kada nema poboljšanja određeni broj epoha (\texttt{early\_stop\_patience}).
+
+Evaluacija koristi \texttt{accuracy\_from\_logits} (\texttt{src/ccc/engine/metrics.py}), dok se matrica konfuzije i makro F1 mogu izračunati dostupnim funkcijama u istom modulu.
+
+\section{Veza matematike i koda: ključne tačke}
+\begin{itemize}
+  \item \textbf{Konvolucija kao matriksno množenje}: $Y=W_{\text{col}}X_{\text{col}}+b\,\mathbf{1}^\top$ u potpunosti se ogleda u \texttt{Conv2D.forward}; gradijenti su neposredne posledice ove forme.
+  \item \textbf{Stabilna softmax entropija}: Oduzimanje \(\max\) po redu je implementirano i odgovara standardnoj stabilizaciji; grad po logitima je $(p{-}Y)/N$.
+  \item \textbf{Pooling backprop}: MaxPool koristi argmax masku; AvgPool i GlobalAvg dele gradijent uniformno.
+  \item \textbf{Normalizacije}: BatchNorm2D agregira po $N\cdot H\cdot W$ u kanalu, LayerNorm po \emph{feature}-ima jedne instance; formule u kodu prate standardne izvode.
+  \item \textbf{Inicijalizacija}: He inicijalizacija smanjuje problem nestajanja/eksplodiranja gradijenata sa ReLU aktivacijama.
+  \item \textbf{Optimizatori}: Implementacije tačno prate kanonske jednačine (SGD, Momentum, NAG, RMSProp, Adam) sa standardnim hiperparametrima.
+\end{itemize}
+
+\section{Zaključak}
+Projekat implementira kompletan CNN trening pipeline od nule u NumPy-u. Svaki sloj i optimizator je direktna implementacija standardnih matematičkih definicija. Posebno, konvolucioni sloj je realizovan preko \texttt{im2col} transformacije koja mapira teorijsku operaciju lokalnih konvolucija na efikasno matriksko množenje, što pojednostavljuje i napredni prolaz i proračun gradijenata.
+
+\end{document}
+
